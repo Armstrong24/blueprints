@@ -1,0 +1,222 @@
+id: github-codeowners-health-sentinel
+namespace: company.team
+description: |
+  Weekly health check for CODEOWNERS files across a list of GitHub repositories.
+  GitHub silently skips any CODEOWNERS line it can't resolve (a renamed team, a
+  user who left, a team without write access, a bad pattern), so the paths
+  behind it stop requesting reviews and nobody notices. This flow asks GitHub's
+  own CODEOWNERS validator for each repository, then opens one tracking issue
+  per broken file with every error and GitHub's suggested fix, or comments on the
+  issue that is already open instead of filing a duplicate.
+
+inputs:
+  - id: repositories
+    type: ARRAY
+    itemType: STRING
+    defaults:
+      - my-org/backend
+      - my-org/frontend
+    description: Repositories to check, as owner/repo.
+
+  - id: issue_label
+    type: STRING
+    defaults: codeowners-health
+    description: Label used to find and tag the tracking issue. Create it in each repository first, or GitHub drops it silently.
+
+  - id: github_api
+    type: STRING
+    defaults: https://api.github.com
+    description: GitHub API base URL. Change it for GitHub Enterprise Server, e.g. https://ghe.acme.com/api/v3.
+
+tasks:
+  - id: each_repository
+    type: io.kestra.plugin.core.flow.Loop
+    description: Check every repository independently, four at a time.
+    values: "{{ inputs.repositories }}"
+    concurrencyLimit: 4
+    tasks:
+      - id: fetch_codeowners_errors
+        type: io.kestra.plugin.core.http.Request
+        description: Ask GitHub's CODEOWNERS validator for the default branch. A 404 means the repository has no CODEOWNERS file at all.
+        uri: "{{ inputs.github_api }}/repos/{{ item.value }}/codeowners/errors"
+        method: GET
+        headers:
+          Accept: application/vnd.github+json
+          Authorization: "Bearer {{ secret('GITHUB_TOKEN') }}"
+          X-GitHub-Api-Version: "2022-11-28"
+        options:
+          allowFailed: true
+
+      - id: classify
+        type: io.kestra.plugin.core.flow.Switch
+        description: Sort each repository into broken, missing, healthy or unreachable.
+        value: >-
+          {%- set res = outputs.fetch_codeowners_errors -%}
+          {%- if res.code == 404 -%}MISSING
+          {%- elseif res.code != 200 -%}UNREACHABLE
+          {%- elseif (fromJson(res.body).errors | length) > 0 -%}BROKEN
+          {%- else -%}HEALTHY{%- endif -%}
+        cases:
+          BROKEN:
+            - id: find_tracking_issue
+              type: io.kestra.plugin.github.issues.Search
+              description: Look for a tracking issue this flow already opened, so a broken file produces one issue, not one a week.
+              endpoint: "{{ inputs.github_api }}"
+              oauthToken: "{{ secret('GITHUB_TOKEN') }}"
+              query: "repo:{{ item.value }} is:issue is:open label:{{ inputs.issue_label }} in:title CODEOWNERS"
+              fetchType: FETCH_ONE
+
+            - id: issue_already_open
+              type: io.kestra.plugin.core.flow.If
+              description: Comment on the open issue if there is one, otherwise open a new one.
+              condition: "{{ outputs.find_tracking_issue.size > 0 }}"
+              then:
+                - id: comment_on_issue
+                  type: io.kestra.plugin.github.issues.Comment
+                  description: Post this week's findings on the existing tracking issue.
+                  endpoint: "{{ inputs.github_api }}"
+                  oauthToken: "{{ secret('GITHUB_TOKEN') }}"
+                  repository: "{{ item.value }}"
+                  issueNumber: "{{ outputs.find_tracking_issue.row.number }}"
+                  body: |
+                    {%- set errors = fromJson(outputs.fetch_codeowners_errors.body).errors -%}
+                    Still broken on {{ execution.startDate | date("yyyy-MM-dd") }}: **{{ errors | length }}** CODEOWNERS error(s).
+
+                    | Line | Problem | Rule | Suggested fix |
+                    |---|---|---|---|
+                    {% for e in errors %}| {{ e.line }} | {{ e.kind }} | `{{ e.source | trim }}` | {{ e.suggestion ?? "-" }} |
+                    {% endfor %}
+                    _Checked by Kestra flow `{{ flow.id }}`, execution `{{ execution.id }}`._
+              else:
+                - id: open_tracking_issue
+                  type: io.kestra.plugin.github.issues.Create
+                  description: Open a tracking issue listing every unresolved CODEOWNERS line with GitHub's suggested fix.
+                  endpoint: "{{ inputs.github_api }}"
+                  oauthToken: "{{ secret('GITHUB_TOKEN') }}"
+                  repository: "{{ item.value }}"
+                  title: "CODEOWNERS has {{ fromJson(outputs.fetch_codeowners_errors.body).errors | length }} line(s) GitHub can't resolve"
+                  labels:
+                    - "{{ inputs.issue_label }}"
+                  body: |
+                    {%- set errors = fromJson(outputs.fetch_codeowners_errors.body).errors -%}
+                    GitHub ignores CODEOWNERS lines it can't resolve, so the paths below are **not requesting any review** right now.
+
+                    | Line | Problem | Rule | Suggested fix |
+                    |---|---|---|---|
+                    {% for e in errors %}| {{ e.line }} | {{ e.kind }} | `{{ e.source | trim }}` | {{ e.suggestion ?? "-" }} |
+                    {% endfor %}
+                    Common causes: a team was renamed or deleted, a user left the organization, or a team was never given write access to this repository.
+
+                    _Opened by Kestra flow `{{ flow.id }}`, execution `{{ execution.id }}`. It comments here each week until the file is clean, then you can close this issue._
+
+          MISSING:
+            - id: log_missing
+              type: io.kestra.plugin.core.log.Log
+              description: Flag repositories with no CODEOWNERS file, where nobody is requested for review by default.
+              level: WARN
+              message: "{{ item.value }} has no CODEOWNERS file, so no reviewer is requested automatically."
+
+          UNREACHABLE:
+            - id: fail_unreachable
+              type: io.kestra.plugin.core.execution.Fail
+              description: Stop on 401, 403 or any other error, so a dead token never reads as a healthy repository.
+              errorMessage: "GitHub returned HTTP {{ outputs.fetch_codeowners_errors.code }} for {{ item.value }}. Check that GITHUB_TOKEN is valid and can read this repository."
+
+        defaults:
+          - id: log_healthy
+            type: io.kestra.plugin.core.log.Log
+            description: Record a clean result in the execution history.
+            message: "{{ item.value }}: every CODEOWNERS line resolves."
+
+triggers:
+  - id: weekly_monday
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: Monday morning, before the week's pull requests pile up.
+    cron: "0 6 * * 1"
+
+extend:
+  title: Find Broken CODEOWNERS Rules Across GitHub Repositories
+  shortDescription: Weekly check of CODEOWNERS with GitHub's own validator, opening or updating one tracking issue per broken file.
+  metaTitle: GitHub CODEOWNERS Health Check | Kestra
+  metaDescription: Find CODEOWNERS lines GitHub can't resolve, like deleted teams or departed users, and track them in one GitHub issue per repository.
+  description: |
+    A CODEOWNERS line that GitHub can't resolve doesn't raise an error. It just
+    stops working: a team was renamed, a user left the organization, a team
+    never got write access, or a pattern has a typo. The paths behind it stop
+    requesting reviews, and nobody notices until something unreviewed ships.
+
+    This blueprint asks GitHub's own CODEOWNERS validator about every repository
+    on your list each week, and turns the problems into one tracking issue per
+    repository, with the line, the problem and GitHub's suggested fix.
+
+    ## How it works
+
+    1. `each_repository` (`io.kestra.plugin.core.flow.Loop`) loops over the
+       `repositories` input, four at a time.
+    2. `fetch_codeowners_errors` (`io.kestra.plugin.core.http.Request`) calls
+       `GET /repos/{owner}/{repo}/codeowners/errors`, the same check GitHub
+       shows in its CODEOWNERS editor.
+    3. `classify` (`io.kestra.plugin.core.flow.Switch`) sorts the repository:
+       - **BROKEN**: `find_tracking_issue` (`io.kestra.plugin.github.issues.Search`)
+         looks for an open issue with the `issue_label` label. If there is one,
+         `comment_on_issue` (`io.kestra.plugin.github.issues.Comment`) posts this
+         week's findings; if not, `open_tracking_issue`
+         (`io.kestra.plugin.github.issues.Create`) opens it.
+       - **MISSING**: no CODEOWNERS file; `log_missing` logs a warning.
+       - **UNREACHABLE**: any other HTTP status; `fail_unreachable` fails the
+         run so a bad token never reads as a healthy repository.
+       - **HEALTHY** (default): `log_healthy` records a clean result.
+    4. A `Schedule` trigger runs every Monday at 06:00 UTC.
+
+    ## Prerequisites
+
+    - A GitHub token that can read each repository and open issues in it.
+    - The `issue_label` label (default `codeowners-health`) created in each
+      repository.
+
+    ## Secrets
+
+    - `GITHUB_TOKEN`: a fine-grained personal access token or GitHub App token
+      with **Contents: read** and **Issues: read and write** on the
+      repositories, plus **Members: read** on the organization. Without
+      organization read access, GitHub can't see private teams and reports them
+      as unknown owners.
+
+    ## Inputs
+
+    | Input | Type | Default | Purpose |
+    |---|---|---|---|
+    | `repositories` | ARRAY of STRING | `[my-org/backend, my-org/frontend]` | Repositories to check |
+    | `issue_label` | STRING | `codeowners-health` | Label that marks the tracking issue |
+    | `github_api` | STRING | `https://api.github.com` | API base URL; change it for GitHub Enterprise Server |
+
+    ## Outputs
+
+    - `{{ outputs.fetch_codeowners_errors.body }}`: GitHub's
+      raw validator response, inside each loop iteration.
+    - `{{ outputs.open_tracking_issue.issueUrl }}`: the issue opened on a
+      repository's first failing run.
+    - A tracking issue per broken repository, titled
+      `CODEOWNERS has N line(s) GitHub can't resolve`, with a table of line,
+      problem, rule and suggested fix.
+
+    ## Notes
+
+    - The check reads the default branch only, the same branch GitHub uses to
+      request reviewers.
+    - When the file is clean again the flow stops commenting; close the issue
+      once you've confirmed the fix.
+
+    ## Links
+
+    - List CODEOWNERS errors API: https://docs.github.com/en/rest/repos/repos#list-codeowners-errors
+    - About code owners: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+    - GitHub plugin: https://kestra.io/plugins/plugin-github
+    - This blueprint has been created by [Armstrong24](https://github.com/Armstrong24)
+  tags:
+    - Infrastructure
+  subTags:
+    - Policy & Compliance
+    - Scheduling
+  ee: false
+  demo: false
